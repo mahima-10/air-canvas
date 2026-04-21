@@ -48,8 +48,12 @@ PALETTE = [
     ("ERASE",   ( 40,  40,  40)),
     ("EYEDROP", ( 80, 140, 200)),
     ("FILL",    (100,  60, 180)),
+    ("LINE",    ( 70,  70,  70)),
+    ("RECT",    ( 70,  70,  70)),
+    ("CIRCLE",  ( 70,  70,  70)),
 ]
-ACTION_LABELS = {"ERASE", "EYEDROP", "FILL"}
+ACTION_LABELS = {"ERASE", "EYEDROP", "FILL", "LINE", "RECT", "CIRCLE"}
+SHAPE_LABELS = {"LINE", "RECT", "CIRCLE"}
 
 
 # ---------- MediaPipe Gesture Recognizer ----------
@@ -156,6 +160,19 @@ def build_toolbar(width):
     return bar, slots
 
 
+def draw_shape(img, tool, p1, p2, color, thickness):
+    """Render LINE / RECT / CIRCLE onto img using two anchor points."""
+    if tool == "LINE":
+        cv2.line(img, p1, p2, color, thickness, cv2.LINE_AA)
+    elif tool == "RECT":
+        cv2.rectangle(img, p1, p2, color, thickness)
+    elif tool == "CIRCLE":
+        # Bounding-box ellipse — perfect circle when bbox is square.
+        cx, cy = (p1[0] + p2[0]) // 2, (p1[1] + p2[1]) // 2
+        ax, ay = max(abs(p2[0] - p1[0]) // 2, 1), max(abs(p2[1] - p1[1]) // 2, 1)
+        cv2.ellipse(img, (cx, cy), (ax, ay), 0, 0, 360, color, thickness, cv2.LINE_AA)
+
+
 def slot_at(x, slots):
     for x1, x2, label, color in slots:
         if x1 <= x < x2:
@@ -221,6 +238,12 @@ def main():
 
     save_flash_until = 0.0
     save_flash_text = ""
+
+    # Shape-tool state (LINE / RECT / CIRCLE): first DRAW frame sets anchor,
+    # subsequent frames show a preview, release commits the shape.
+    shape_tool = None
+    shape_anchor = None
+    shape_last = None
 
     options = mp_vision.GestureRecognizerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=MODEL_PATH),
@@ -300,14 +323,21 @@ def main():
                 top_gesture_label = f"{top.category_name}({top.score:.2f})"
                 gesture = GESTURE_MAP.get(top.category_name, "IDLE")
 
-            # Fallback: Google's classifier only fires on textbook poses.
-            # Accept casual pointing poses via two cheap landmark checks:
-            #   (a) index tip clearly higher than middle/ring/pinky tips
-            #       (works when hand is roughly upright)
-            #   (b) index tip farther from the wrist in 3D than any other
-            #       finger tip (works when the hand points toward the camera
-            #       or sideways, where tips share a y-row but index sticks out)
-            if gesture == "IDLE":
+            # Fallback: Google's classifier only fires on textbook poses. If
+            # it returns nothing useful, run a stricter landmark-based check.
+            # We don't fall back when the classifier is CONFIDENT about a
+            # different gesture (Closed_Fist, Thumb_Up, etc.) — otherwise a
+            # closed fist keeps registering as DRAW from landmark noise.
+            classifier_blocks_fallback = False
+            if result.gestures and result.gestures[0]:
+                top = result.gestures[0][0]
+                if top.score > 0.5 and top.category_name in {
+                    "Closed_Fist", "Thumb_Up", "Thumb_Down",
+                    "ILoveYou", "Open_Palm",
+                }:
+                    classifier_blocks_fallback = True
+
+            if gesture == "IDLE" and not classifier_blocks_fallback:
                 def _d3(a, b):
                     return ((a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2) ** 0.5
                 wrist = landmarks[0]
@@ -315,8 +345,10 @@ def main():
                 other_tips_y = [landmarks[i].y for i in (12, 16, 20)]
                 idx_reach = _d3(landmarks[8], wrist)
                 other_reaches = [_d3(landmarks[i], wrist) for i in (12, 16, 20)]
-                if (iy_n < min(other_tips_y) - 0.04
-                        or idx_reach > max(other_reaches) * 1.15):
+                # Require a genuinely-extended index: either clearly above the
+                # other tips, or reaching 1.6x further from the wrist.
+                if (iy_n < min(other_tips_y) - 0.08
+                        or idx_reach > max(other_reaches) * 1.6):
                     gesture = "DRAW"
                     if not top_gesture_label:
                         top_gesture_label = "Pointing(fallback)"
@@ -358,6 +390,10 @@ def main():
                     # Don't overwrite active_color — fill uses the last picked color.
                     active_label = "FILL"
                     eyedrop_armed = False
+                elif label in SHAPE_LABELS:
+                    # Shapes also reuse the current active_color.
+                    active_label = label
+                    eyedrop_armed = False
                 elif label:
                     active_color = color
                     active_label = label
@@ -379,6 +415,13 @@ def main():
                     active_color = (int(bgr[0]), int(bgr[1]), int(bgr[2]))
                     active_label = "CUSTOM"
                     eyedrop_armed = False
+                prev_point = None
+            elif active_label in SHAPE_LABELS:
+                mode = active_label
+                if shape_anchor is None:
+                    shape_tool = active_label
+                    shape_anchor = cursor
+                shape_last = cursor
                 prev_point = None
             elif active_label == "FILL":
                 mode = "FILL"
@@ -413,6 +456,16 @@ def main():
             mode = "IDLE"
             end_stroke()
 
+        # Commit a pending shape the moment the user releases DRAW.
+        if shape_anchor is not None and gesture != "DRAW":
+            if shape_last is not None and shape_tool is not None:
+                push_undo()
+                draw_shape(canvas, shape_tool, shape_anchor, shape_last,
+                           active_color, thickness)
+            shape_tool = None
+            shape_anchor = None
+            shape_last = None
+
         # ----- Composite output -----
         mask = canvas.any(axis=2)
         output = frame.copy()
@@ -427,6 +480,11 @@ def main():
         slider_hover = cursor[0] if (cursor and gesture == "SELECT"
                                      and TOOLBAR_HEIGHT <= cursor[1] < UI_HEIGHT) else None
         draw_slider(output, TOOLBAR_HEIGHT, w, thickness, active_color, slider_hover)
+
+        # Live shape preview while user is holding DRAW with a shape tool.
+        if shape_anchor is not None and cursor is not None and shape_tool is not None:
+            draw_shape(output, shape_tool, shape_anchor, cursor, active_color, thickness)
+            cv2.circle(output, shape_anchor, 5, (0, 255, 255), -1)
 
         if cursor:
             ring_color = active_color if active_label != "ERASE" else (200, 200, 200)
