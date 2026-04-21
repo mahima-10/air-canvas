@@ -1,0 +1,17 @@
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Auto-downloaded on first run (~8 MB each)
+hand_landmarker.task
+gesture_recognizer.task
+
+# Saved drawings
+air_drawing_*.png
+air_drawing_output.png
+
+# macOS / editors
+.DS_Store
+.idea/
+.vscode/
